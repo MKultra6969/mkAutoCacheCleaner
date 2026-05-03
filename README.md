@@ -13,6 +13,8 @@
   </a>
 </p>
 
+![Menu](https://raw.githubusercontent.com/MKultra6969/mkAutoCacheCleaner/refs/heads/main/preview.png)
+
 </div>
 
 ## ⚡ Description
