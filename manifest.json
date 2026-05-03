@@ -1,0 +1,16 @@
+[
+  {
+    "name": "mkAutoCacheCleaner",
+    "description": "Automatically cleans Spotify offline cache from the Spicetify profile menu.",
+    "preview": "preview.png",
+    "main": "autoCacheCleaner.js",
+    "readme": "README.md",
+    "authors": [
+      {
+        "name": "MKultra69",
+        "url": "https://github.com/MKultra6969"
+      }
+    ],
+    "tags": ["cache", "cleanup", "utility"]
+  }
+]
