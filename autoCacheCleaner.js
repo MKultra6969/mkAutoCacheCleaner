@@ -1,6 +1,9 @@
-// autoCacheCleaner.pretty.js
+// autoCacheCleaner.js v1.1.0
 // @ts-check
 (async function autoCacheCleaner() {
+    if (window.__mkCacheCleanerLoaded) return;
+    window.__mkCacheCleanerLoaded = true;
+
     while (
         !window.Spicetify?.showNotification ||
         !window.Spicetify?.PopupModal ||
@@ -13,8 +16,7 @@
     }
 
     const React = Spicetify.React;
-    const { useState, useEffect } = React;
-    const RC = Spicetify.ReactComponent || {};
+    const { useState, useEffect, useRef } = React;
 
     const STORAGE_KEY = "mkultra69:cache-cleaner:config:v2";
     const STYLE_ID = "mkultra69-cache-cleaner-style";
@@ -27,7 +29,10 @@
         monthly: 30 * 24 * 60 * 60 * 1000,
     };
 
-    const THRESHOLD_RETRY_DELAY = 60 * 60 * 1000;
+    const STORAGE_TIMEOUT = 15 * 1000;
+    const DELETE_TIMEOUT = 120 * 1000;
+    const RETRY_DELAY = 60 * 60 * 1000;
+    const languageOptions = ["auto", "en", "ru"];
 
     function createDefaultConfig() {
         return {
@@ -37,6 +42,36 @@
             threshold: 0,
             nextRunAt: Date.now() + timeMap.weekly,
             totalCleared: 0,
+            language: "auto",
+        };
+    }
+
+    function sanitizeConfig(obj) {
+        const defaults = createDefaultConfig();
+        if (!obj || typeof obj !== "object" || Array.isArray(obj)) return defaults;
+
+        const frequency = Object.prototype.hasOwnProperty.call(timeMap, obj.frequency)
+            ? obj.frequency
+            : "weekly";
+
+        const threshold = Number(obj.threshold);
+        const totalCleared = Number(obj.totalCleared);
+        const language = languageOptions.includes(obj.language) ? obj.language : "auto";
+
+        let nextRunAt = 0;
+        if (timeMap[frequency] > 1) {
+            const stored = Number(obj.nextRunAt);
+            nextRunAt = Number.isFinite(stored) && stored > 0 ? stored : Date.now() + timeMap[frequency];
+        }
+
+        return {
+            enabled: typeof obj.enabled === "boolean" ? obj.enabled : defaults.enabled,
+            notify: typeof obj.notify === "boolean" ? obj.notify : defaults.notify,
+            frequency,
+            threshold: Number.isFinite(threshold) && threshold >= 0 ? Math.floor(threshold) : 0,
+            nextRunAt,
+            totalCleared: Number.isFinite(totalCleared) && totalCleared >= 0 ? totalCleared : 0,
+            language,
         };
     }
 
@@ -48,13 +83,14 @@
         style.textContent = `
             .cc-modal {
                 color: var(--spice-text);
-                min-width: 620px;
-                max-width: 760px;
+                width: 100%;
+                box-sizing: border-box;
                 padding: 4px 2px 0;
             }
 
             .cc-hero {
                 display: flex;
+                flex-wrap: wrap;
                 align-items: flex-start;
                 justify-content: space-between;
                 gap: 16px;
@@ -67,6 +103,11 @@
                         rgba(var(--spice-rgb-main), 0.88));
                 border: 1px solid rgba(var(--spice-rgb-text), 0.08);
                 box-shadow: 0 10px 30px rgba(var(--spice-rgb-shadow), 0.18);
+            }
+
+            .cc-hero > :first-child {
+                flex: 1 1 260px;
+                min-width: 0;
             }
 
             .cc-hero__title {
@@ -310,8 +351,8 @@
             }
 
             @media (max-width: 720px) {
-                .cc-modal {
-                    min-width: 0;
+                .cc-hero > :first-child {
+                    flex: 0 0 auto;
                 }
 
                 .cc-hero,
@@ -341,15 +382,31 @@
     }
 
     function loadConfig() {
+        let raw = null;
         try {
-            const raw = Spicetify.LocalStorage.get(STORAGE_KEY);
-            if (!raw) return createDefaultConfig();
-            return { ...createDefaultConfig(), ...JSON.parse(raw) };
+            raw = Spicetify.LocalStorage.get(STORAGE_KEY);
         } catch (e) {
             console.error("[cache-cleaner] loadConfig failed", e);
-            return createDefaultConfig();
+            return sanitizeConfig(config);
         }
+
+        let parsed = null;
+        if (raw) {
+            try {
+                parsed = JSON.parse(raw);
+            } catch (e) {
+                console.error("[cache-cleaner] loadConfig failed", e);
+            }
+        }
+
+        const sanitized = sanitizeConfig(parsed);
+        if (!raw || JSON.stringify(sanitized) !== raw) {
+            saveConfig(sanitized);
+        }
+        return sanitized;
     }
+
+    const configListeners = new Set();
 
     function saveConfig(cfg) {
         try {
@@ -357,51 +414,51 @@
         } catch (e) {
             console.error("[cache-cleaner] saveConfig failed", e);
         }
+
+        for (const listener of configListeners) {
+            try {
+                listener({ ...cfg });
+            } catch (e) {
+                console.error("[cache-cleaner] config listener failed", e);
+            }
+        }
     }
 
-    let config = loadConfig();
+    let config = createDefaultConfig();
     let clearInProgress = false;
     let autoRunInProgress = false;
     let launchCleanAttempted = false;
     let nextThresholdRetryAt = 0;
     
     function scheduleNextRun() {
-        if (!timeMap[config.frequency]) {
-            config.nextRunAt = 0;
-        } else if (config.frequency === "launch") {
-            config.nextRunAt = 0;
-        } else {
-            config.nextRunAt = Date.now() + timeMap[config.frequency];
-        }
+        const period = timeMap[config.frequency];
+        config.nextRunAt = period > 1 ? Date.now() + period : 0;
         saveConfig(config);
     }
 
-    function finishAutomaticAttempt(frequency) {
-        if (!timeMap[frequency] || frequency === "launch") {
-            config.nextRunAt = 0;
-        } else {
-            config.nextRunAt = Date.now() + timeMap[frequency];
+    function retryScheduledRun() {
+        if (timeMap[config.frequency] > 1) {
+            config.nextRunAt = Date.now() + RETRY_DELAY;
         }
         saveConfig(config);
-    }
-
-    function getNavigatorLanguage(index = 0) {
-        if (typeof navigator === "undefined") return null;
-        return navigator.languages?.[index] || navigator.language || null;
     }
 
     function detectLanguage() {
-        const candidates = [
-            Spicetify.Locale?.getLocale?.(),
-            Spicetify.Locale?.locale,
-            Spicetify.Locale?._locale,
-            Spicetify.Platform?.LocaleAPI?.getLocale?.(),
-            Spicetify.Platform?.LocaleAPI?.locale,
-            Spicetify.Platform?.Session?.locale,
-            getNavigatorLanguage(0),
+        const readers = [
+            () => Spicetify.Locale.getLocale(),
+            () => navigator.language,
         ];
-        const lang = candidates.find((value) => typeof value === "string" && value.trim());
-        return lang?.toLowerCase().startsWith("en") ? "en" : "ru";
+        for (const read of readers) {
+            try {
+                const value = read();
+                if (typeof value === "string" && value.trim()) {
+                    return value.trim().toLowerCase().startsWith("ru") ? "ru" : "en";
+                }
+            } catch (e) {
+                // This source is not available, so try the next one.
+            }
+        }
+        return "en";
     }
 
     const strings = {
@@ -411,12 +468,13 @@
             apiReady: "Storage API ready",
             cacheBadge: "Cache: ",
             cacheCleaner: "Cache Cleaner",
-            cacheUnchanged: "Cache did not change: the method removed nothing",
+            cacheSizeUnknown: "Cleanup finished, but the new cache size could not be read",
+            cacheUnchanged: "Cache did not change: nothing was removed",
             clearNow: "Clear now",
-            cleanupFrequencyHint: "When to run the automatic schedule check.",
+            cleanupFrequencyHint: "How often the cache is cleaned automatically.",
             cleanupFrequencyLabel: "Cleanup frequency",
             cleanupInProgress: "Cache cleanup is already running",
-            cleaned: (amount) => `Cleared ${amount} MB of cache`,
+            cleaned: (size) => `Cleared ${size} of cache`,
             cleaning: "Cleaning...",
             currentCacheHint: "Manually clear cache and immediately refresh the displayed size.",
             currentCacheLabel: "Current cache status",
@@ -424,13 +482,16 @@
             disabled: "Disabled",
             enableAutoHint: "Enables automatic cache cleanup by schedule or size threshold.",
             enableAutoLabel: "Enable auto clean",
-            footer:
-                "If you see \"Storage API missing\" or \"Unavailable\", the current Spotify client changed its internal storage API again.",
+            footer: (missing, unavailable) =>
+                `If you see "${missing}" or "${unavailable}", this Spotify version has changed its internal storage API and the extension cannot clean the cache yet.`,
             heroDescription:
                 "Automatic Spotify offline cache cleanup by schedule or size threshold.",
             inDays: (days, hours) => `In ${days}d ${hours}h`,
             inHours: (hours, minutes) => `In ${hours}h ${minutes}m`,
             inMinutes: (minutes) => `In ${minutes}m`,
+            languageAuto: "Auto",
+            languageHint: "Auto follows the Spotify interface language.",
+            languageLabel: "Language",
             monthly: "Monthly",
             never: "Never",
             nextBadge: "Next: ",
@@ -446,6 +507,7 @@
             sizeThresholdHint:
                 "If the value is greater than 0, cache is cleaned when it exceeds this size.",
             sizeThresholdLabel: "Size threshold",
+            thresholdOnly: "By size threshold",
             totalClearedBadge: "Total cleared cache by Cache Cleaner: ",
             unavailable: "Unavailable",
             failedCleanup: "Failed to clear cache",
@@ -453,16 +515,17 @@
         },
         ru: {
             afterRestart: "После перезапуска",
-            apiMissing: "Storage API missing",
-            apiReady: "Storage API ready",
+            apiMissing: "Storage API не найден",
+            apiReady: "Storage API найден",
             cacheBadge: "Кэш: ",
             cacheCleaner: "Cache Cleaner",
-            cacheUnchanged: "Кэш не изменился: метод ничего не удалил",
+            cacheSizeUnknown: "Очистка завершена, но новый размер кэша прочитать не удалось",
+            cacheUnchanged: "Кэш не изменился: ничего не удалено",
             clearNow: "Очистить сейчас",
-            cleanupFrequencyHint: "Когда запускать автоматическую проверку таймера.",
+            cleanupFrequencyHint: "Как часто автоматически очищать кэш.",
             cleanupFrequencyLabel: "Частота очистки",
             cleanupInProgress: "Очистка кэша уже выполняется",
-            cleaned: (amount) => `Очищено ${amount} MB кэша`,
+            cleaned: (size) => `Очищено ${size} кэша`,
             cleaning: "Очистка...",
             currentCacheHint: "Можно вручную очистить кэш и сразу обновить отображаемый размер.",
             currentCacheLabel: "Текущий статус кэша",
@@ -470,17 +533,20 @@
             disabled: "Отключено",
             enableAutoHint: "Включает автоматическую очистку кэша по расписанию или по порогу размера.",
             enableAutoLabel: "Включить автоочистку",
-            footer:
-                "Если видишь \"Storage API missing\" или \"Unavailable\", значит текущий Spotify снова сменил внутренний storage API.",
+            footer: (missing, unavailable) =>
+                `Если видишь «${missing}» или «${unavailable}», значит, Spotify снова поменял внутренний storage API и расширение пока не может очищать кэш.`,
             heroDescription:
-                "Автоматическая очистка оффлайн-кэша Spotify по таймеру или по порогу размера.",
-            inDays: (days, hours) => `Через ${days} д ${hours} ч`,
+                "Автоматическая очистка оффлайн-кэша Spotify по расписанию или по порогу размера.",
+            inDays: (days, hours) => `Через ${days} дн ${hours} ч`,
             inHours: (hours, minutes) => `Через ${hours} ч ${minutes} мин`,
             inMinutes: (minutes) => `Через ${minutes} мин`,
+            languageAuto: "Авто",
+            languageHint: "«Авто» берёт язык интерфейса Spotify.",
+            languageLabel: "Язык",
             monthly: "Ежемесячно",
             never: "Никогда",
             nextBadge: "Следующая: ",
-            noStorageApi: "Storage API не найден в текущем Spotify клиенте",
+            noStorageApi: "Storage API не найден в текущем клиенте Spotify",
             now: "Сейчас",
             onLaunch: "При запуске",
             onNextLaunch: "При следующем запуске",
@@ -492,6 +558,7 @@
             sizeThresholdHint:
                 "Если значение больше 0, кэш будет очищаться при превышении указанного размера.",
             sizeThresholdLabel: "Порог размера",
+            thresholdOnly: "По порогу размера",
             totalClearedBadge: "Всего очищено Cache Cleaner: ",
             unavailable: "Недоступно",
             failedCleanup: "Не удалось очистить кэш",
@@ -499,14 +566,47 @@
         },
     };
 
-    const language = detectLanguage();
+    let language = "en";
     const t = (key, ...args) => {
-        const value = strings[language]?.[key] ?? strings.ru[key] ?? key;
+        const value = strings[language]?.[key] ?? strings.en[key] ?? key;
         return typeof value === "function" ? value(...args) : value;
     };
 
+    function applyLanguage() {
+        language = config.language === "auto" ? detectLanguage() : config.language;
+    }
+
     function notify(text, error = false) {
-        Spicetify.showNotification(text, error);
+        try {
+            Spicetify.showNotification(text, error);
+        } catch (e) {
+            console.error("[cache-cleaner] notification failed", e);
+        }
+    }
+
+    function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function withTimeout(promise, ms = STORAGE_TIMEOUT) {
+        let timer = null;
+        const timeout = new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error("storage timeout")), ms);
+        });
+        return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+    }
+
+    function toSize(stats) {
+        const raw = stats?.currentSize;
+        if (raw === undefined || raw === null || raw === "") return NaN;
+        const size = Number(raw);
+        return Number.isFinite(size) ? size : NaN;
+    }
+
+    function formatSize(mb) {
+        if (!Number.isFinite(mb)) return t("unavailable");
+        if (mb < 1024) return `${Math.round(mb)} MB`;
+        return `${(mb / 1024).toFixed(1)} GB`;
     }
 
     function resolveStorageApi() {
@@ -532,7 +632,7 @@
         if (!storage) return null;
 
         try {
-            const stats = await storage.getStats({});
+            const stats = await withTimeout(storage.getStats({}));
             return stats || null;
         } catch (e) {
             console.error("[cache-cleaner] getStats failed", e);
@@ -540,13 +640,14 @@
         }
     }
 
-    function formatNextRun(ts, frequency) {
-        if (frequency === "never") return t("disabled");
-        if (frequency === "launch") return launchCleanAttempted ? t("afterRestart") : t("onNextLaunch");
-        if (!ts) return t("disabled");
-        const diff = ts - Date.now();
+    function formatNextRun(cfg) {
+        if (!cfg.enabled) return t("disabled");
+        if (cfg.frequency === "never") return cfg.threshold > 0 ? t("thresholdOnly") : t("disabled");
+        if (cfg.frequency === "launch") return launchCleanAttempted ? t("afterRestart") : t("onNextLaunch");
+        if (!cfg.nextRunAt) return t("disabled");
+        const diff = cfg.nextRunAt - Date.now();
         if (diff <= 0) return t("now");
-        const min = Math.floor(diff / 60000);
+        const min = Math.max(1, Math.floor(diff / 60000));
         const h = Math.floor(min / 60);
         const d = Math.floor(h / 24);
 
@@ -555,71 +656,66 @@
         return t("inMinutes", min);
     }
 
-    async function clearCache({ automatic = false, reschedule = false, frequency = config.frequency } = {}) {
+    async function clearCache({ automatic = false } = {}) {
         if (clearInProgress) {
-            if (!automatic) {
-                notify(t("cleanupInProgress"), true);
-            }
-            return false;
+            if (!automatic) notify(t("cleanupInProgress"), true);
+            return { status: "busy", cleaned: 0, afterSize: NaN };
         }
 
         const storage = resolveStorageApi();
-        const shouldNotify = !automatic || config.notify;
-
         if (!storage) {
-            if (shouldNotify) {
-                notify(t("noStorageApi"), true);
-            }
-            if (reschedule) {
-                finishAutomaticAttempt(frequency);
-            }
-            return false;
+            if (!automatic) notify(t("noStorageApi"), true);
+            return { status: "no-api", cleaned: 0, afterSize: NaN };
         }
 
         clearInProgress = true;
 
         try {
-            const before = await storage.getStats({});
-            const beforeSize = Number(before?.currentSize || 0);
+            const beforeSize = toSize(await withTimeout(storage.getStats({})));
+            await withTimeout(storage.deleteUnlockedItems({}), DELETE_TIMEOUT);
 
-            await storage.deleteUnlockedItems({});
-            await new Promise((r) => setTimeout(r, 1200));
+            // Polls after a successful delete may fail. Keep the last good reading.
+            let afterSize = NaN;
+            const pollAfterSize = async () => {
+                try {
+                    const size = toSize(await withTimeout(storage.getStats({})));
+                    if (Number.isFinite(size)) afterSize = size;
+                } catch (e) {
+                    console.error("[cache-cleaner] getStats after cleanup failed", e);
+                }
+            };
 
-            const after = await storage.getStats({});
-            const afterSize = Number(after?.currentSize || 0);
-            const cleaned = Math.max(0, beforeSize - afterSize);
+            if (beforeSize > 0) {
+                for (let attempt = 0; attempt < 5; attempt++) {
+                    await sleep(1000);
+                    await pollAfterSize();
+                    if (afterSize < beforeSize) break;
+                }
+            } else {
+                await pollAfterSize();
+            }
+
+            const cleaned =
+                Number.isFinite(beforeSize) && Number.isFinite(afterSize)
+                    ? Math.max(0, beforeSize - afterSize)
+                    : 0;
 
             if (cleaned > 0) {
-                config.totalCleared = Number(config.totalCleared || 0) + cleaned;
-
-                if (shouldNotify) {
-                    notify(t("cleaned", cleaned));
-                }
-                if (reschedule) {
-                    finishAutomaticAttempt(frequency);
-                } else {
-                    scheduleNextRun();
-                }
-                return true;
+                config.totalCleared = Number(config.totalCleared) + cleaned;
+                saveConfig(config);
+                if (!automatic || config.notify) notify(t("cleaned", formatSize(cleaned)));
+                return { status: "cleaned", cleaned, afterSize };
             }
 
             if (!automatic) {
-                notify(t("cacheUnchanged"), true);
+                const sizeUnknown = !Number.isFinite(beforeSize) || !Number.isFinite(afterSize);
+                notify(t(sizeUnknown ? "cacheSizeUnknown" : "cacheUnchanged"));
             }
-
-            if (reschedule) {
-                finishAutomaticAttempt(frequency);
-            }
-            return false;
+            return { status: "unchanged", cleaned: 0, afterSize };
         } catch (e) {
             console.error("[cache-cleaner] clearCache failed", e);
-            if (shouldNotify) {
-                notify(t("failedCleanup"), true);
-            }
-            if (reschedule) {
-                finishAutomaticAttempt(frequency);
-            }
-            return false;
+            if (!automatic || config.notify) notify(t("failedCleanup"), true);
+            return { status: "failed", cleaned: 0, afterSize: NaN };
         } finally {
             clearInProgress = false;
         }
@@ -627,7 +723,6 @@
 
     function Hero({ cacheSize, apiAvailable, nextRun, totalCleared }) {
         const heroIcon = Spicetify.SVGIcons?.download || Spicetify.SVGIcons?.check;
-        const totalClearedMb = Math.round(Number(totalCleared || 0));
 
         return React.createElement(
             "div",
@@ -660,13 +755,13 @@
                     { className: "cc-badges" },
                     React.createElement(
                         "div",
-                        { className: "cc-badge" },
+                        { className: "cc-badge", "data-cc": "cache-badge" },
                         t("cacheBadge"),
                         cacheSize
                     ),
                     React.createElement(
                         "div",
-                        { className: "cc-badge" },
+                        { className: "cc-badge", "data-cc": "next-badge" },
                         t("nextBadge"),
                         nextRun
                     ),
@@ -674,6 +769,7 @@
                         "div",
                         {
                             className: `cc-badge ${apiAvailable ? "cc-badge--green" : "cc-badge--red"}`,
+                            "data-cc": "api-badge",
                         },
                         apiAvailable ? t("apiReady") : t("apiMissing")
                     )
@@ -689,8 +785,8 @@
                 ),
                 React.createElement(
                     "div",
-                    { className: "cc-hero__metric-value" },
-                    `${totalClearedMb} MB`
+                    { className: "cc-hero__metric-value", "data-cc": "total-cleared" },
+                    formatSize(Number(totalCleared) || 0)
                 )
             )
         );
@@ -710,39 +806,104 @@
         );
     }
 
-    function NiceToggle({ value, onChange }) {
-        if (RC.Toggle) {
-            return React.createElement(RC.Toggle, {
+    function NiceToggle({ id, value, disabled, onChange }) {
+        const Toggle = Spicetify.ReactComponent?.Toggle;
+        if (Toggle) {
+            return React.createElement(Toggle, {
+                id,
                 value,
+                disabled,
                 onSelected: onChange,
-                id: `cc-toggle-${Math.random().toString(36).slice(2, 8)}`,
             });
         }
 
         return React.createElement("input", {
             type: "checkbox",
+            id,
             checked: value,
+            disabled,
             onChange: (e) => onChange(e.target.checked),
         });
     }
 
+    function commitThreshold(draft, value, onCommit) {
+        const n = Math.max(0, Math.floor(Number(draft)) || 0);
+        if (n !== value) onCommit(n);
+        return n;
+    }
+
+    function ThresholdInput({ value, disabled, onCommit }) {
+        const [draft, setDraft] = useState(String(value));
+        const latest = useRef(null);
+        latest.current = { draft, value, onCommit };
+
+        useEffect(() => {
+            setDraft(String(value));
+        }, [value]);
+
+        // The popup can close with an uncommitted draft. Commit it on unmount.
+        useEffect(() => {
+            return () => {
+                const { draft: pending, value: committed, onCommit: save } = latest.current;
+                commitThreshold(pending, committed, save);
+            };
+        }, []);
+
+        function commit() {
+            setDraft(String(commitThreshold(draft, value, onCommit)));
+        }
+
+        return React.createElement("input", {
+            className: "cc-input",
+            name: "cc-threshold",
+            type: "number",
+            min: 0,
+            step: 1,
+            value: draft,
+            disabled,
+            onChange: (e) => setDraft(e.target.value),
+            onBlur: commit,
+            onKeyDown: (e) => {
+                if (e.key === "Enter") commit();
+            },
+        });
+    }
+
     function ConfigModal() {
-        const [state, setState] = useState(config);
-        const [cacheSize, setCacheSize] = useState("...");
+        const [state, setState] = useState(() => ({ ...config }));
+        const [cacheSize, setCacheSize] = useState(null);
         const [apiAvailable, setApiAvailable] = useState(!!resolveStorageApi());
         const [loading, setLoading] = useState(false);
+        const [, setTick] = useState(0);
+        const statsRequest = useRef(0);
 
         async function refreshStats() {
+            const request = ++statsRequest.current;
             const stats = await getStatsSafe();
+            if (request !== statsRequest.current) return;
             setApiAvailable(!!resolveStorageApi());
-            setCacheSize(stats ? `${stats.currentSize} MB` : t("unavailable"));
+            setCacheSize(toSize(stats));
         }
+
+        useEffect(() => {
+            const listener = (cfg) => setState(cfg);
+            configListeners.add(listener);
+            return () => {
+                configListeners.delete(listener);
+            };
+        }, []);
+
+        useEffect(() => {
+            const timer = setInterval(() => setTick((x) => x + 1), 30000);
+            return () => clearInterval(timer);
+        }, []);
 
         useEffect(() => {
             refreshStats();
         }, []);
 
         function update(patch) {
+            const wasEnabled = config.enabled;
             config = { ...config, ...patch };
 
             if (patch.threshold !== undefined || patch.frequency !== undefined) {
@@ -753,7 +914,19 @@
                 launchCleanAttempted = true;
             }
 
-            if (patch.frequency !== undefined) {
+            let reschedule = patch.frequency !== undefined;
+            if (patch.enabled === true && !wasEnabled) {
+                launchCleanAttempted = true;
+                if (timeMap[config.frequency] > 1 && !(config.nextRunAt > Date.now())) {
+                    reschedule = true;
+                }
+            }
+
+            if (patch.language !== undefined) {
+                applyLanguage();
+            }
+
+            if (reschedule) {
                 scheduleNextRun();
             } else {
                 saveConfig(config);
@@ -765,8 +938,8 @@
         async function handleClearNow() {
             setLoading(true);
             try {
-                await clearCache({ automatic: false });
-                config = loadConfig();
+                const result = await clearCache({ automatic: false });
+                if (result.status === "cleaned") scheduleNextRun();
                 setState({ ...config });
                 await refreshStats();
             } finally {
@@ -774,13 +947,15 @@
             }
         }
 
+        const cacheText = cacheSize === null ? "..." : formatSize(cacheSize);
+
         return React.createElement(
             "div",
             { className: "cc-modal" },
             React.createElement(Hero, {
-                cacheSize,
+                cacheSize: cacheText,
                 apiAvailable,
-                nextRun: formatNextRun(state.nextRunAt, state.frequency),
+                nextRun: formatNextRun(state),
                 totalCleared: state.totalCleared,
             }),
             React.createElement(
@@ -793,6 +968,7 @@
                         label: t("enableAutoLabel"),
                         hint: t("enableAutoHint"),
                         action: React.createElement(NiceToggle, {
+                            id: "cc-toggle-enabled",
                             value: !!state.enabled,
                             onChange: (v) => update({ enabled: v }),
                         }),
@@ -801,9 +977,26 @@
                         label: t("showNotificationLabel"),
                         hint: t("showNotificationHint"),
                         action: React.createElement(NiceToggle, {
+                            id: "cc-toggle-notify",
                             value: !!state.notify,
                             onChange: (v) => update({ notify: v }),
                         }),
+                    }),
+                    React.createElement(Row, {
+                        label: t("languageLabel"),
+                        hint: t("languageHint"),
+                        action: React.createElement(
+                            "select",
+                            {
+                                className: "cc-select",
+                                name: "cc-language",
+                                value: state.language,
+                                onChange: (e) => update({ language: e.target.value }),
+                            },
+                            React.createElement("option", { value: "auto" }, t("languageAuto")),
+                            React.createElement("option", { value: "en" }, "English"),
+                            React.createElement("option", { value: "ru" }, "Русский")
+                        ),
                     })
                 ),
                 React.createElement(
@@ -816,6 +1009,7 @@
                             "select",
                             {
                                 className: "cc-select",
+                                name: "cc-frequency",
                                 value: state.frequency,
                                 disabled: !state.enabled,
                                 onChange: (e) => update({ frequency: e.target.value }),
@@ -833,17 +1027,10 @@
                         action: React.createElement(
                             React.Fragment,
                             null,
-                            React.createElement("input", {
-                                className: "cc-input",
-                                type: "number",
-                                min: 0,
-                                step: 1,
+                            React.createElement(ThresholdInput, {
                                 value: state.threshold,
                                 disabled: !state.enabled,
-                                onChange: (e) =>
-                                    update({
-                                        threshold: Math.max(0, Number(e.target.value) || 0),
-                                    }),
+                                onCommit: (n) => update({ threshold: n }),
                             }),
                             React.createElement("span", {
                                 style: { opacity: 0.7, fontSize: "0.83rem" },
@@ -865,7 +1052,7 @@
                             React.createElement(
                                 "span",
                                 { style: { fontWeight: 700, fontVariantNumeric: "tabular-nums" } },
-                                cacheSize
+                                cacheText
                             )
                         ),
                     }),
@@ -875,6 +1062,7 @@
                         React.createElement(
                             "button",
                             {
+                                name: "cc-clear-now",
                                 className: "cc-btn cc-btn--primary",
                                 onClick: handleClearNow,
                                 disabled: loading,
@@ -884,6 +1072,7 @@
                         React.createElement(
                             "button",
                             {
+                                name: "cc-refresh-stats",
                                 className: "cc-btn cc-btn--secondary",
                                 onClick: refreshStats,
                             },
@@ -892,10 +1081,12 @@
                         React.createElement(
                             "button",
                             {
+                                name: "cc-reset-config",
                                 className: "cc-btn cc-btn--secondary",
                                 onClick: () => {
-                                    config = createDefaultConfig();
+                                    config = { ...createDefaultConfig(), totalCleared: config.totalCleared };
                                     nextThresholdRetryAt = 0;
+                                    applyLanguage();
                                     saveConfig(config);
                                     setState({ ...config });
                                     refreshStats();
@@ -910,12 +1101,13 @@
             React.createElement(
                 "div",
                 { className: "cc-footer" },
-                t("footer")
+                t("footer", t("apiMissing"), t("unavailable"))
             )
         );
     }
 
     function openConfig() {
+        applyLanguage();
         injectStyles();
         Spicetify.PopupModal.display({
             title: t("cacheCleaner"),
@@ -924,54 +1116,59 @@
         });
     }
 
-    new Spicetify.Menu.Item(t("cacheCleaner"), true, openConfig).register();
-
     async function autoRunCheck() {
-        if (autoRunInProgress) return;
+        if (autoRunInProgress || clearInProgress) return;
         autoRunInProgress = true;
 
         try {
             config = loadConfig();
+            applyLanguage();
             if (!config.enabled) return;
+            if (!resolveStorageApi()) return;
 
-            const stats = await getStatsSafe();
-            const currentSize = Number(stats?.currentSize || 0);
-            const threshold = Number(config.threshold || 0);
-            const now = Date.now();
-
-            if (threshold > 0 && currentSize > threshold && now >= nextThresholdRetryAt) {
-                if (config.frequency === "launch") {
-                    launchCleanAttempted = true;
+            const threshold = config.threshold;
+            if (threshold > 0 && Date.now() >= nextThresholdRetryAt) {
+                const size = toSize(await getStatsSafe());
+                if (Number.isFinite(size) && size > threshold) {
+                    if (config.frequency === "launch") launchCleanAttempted = true;
+                    const res = await clearCache({ automatic: true });
+                    if (res.status === "cleaned") scheduleNextRun();
+                    // The threshold can change while the cleanup runs. update() already reset
+                    // the retry timer then, so this result must not overwrite that reset.
+                    const liveThreshold = Number(config.threshold) || 0;
+                    if (liveThreshold === threshold && res.status !== "busy" && res.status !== "no-api") {
+                        nextThresholdRetryAt =
+                            res.status === "cleaned" && Number.isFinite(res.afterSize) && res.afterSize <= liveThreshold
+                                ? 0
+                                : Date.now() + RETRY_DELAY;
+                    }
+                    return;
                 }
-                const cleaned = await clearCache({ automatic: true });
-                nextThresholdRetryAt = cleaned ? 0 : Date.now() + THRESHOLD_RETRY_DELAY;
-                return;
             }
 
             if (config.frequency === "launch") {
                 if (!launchCleanAttempted) {
                     launchCleanAttempted = true;
-                    await clearCache({
-                        automatic: true,
-                        reschedule: true,
-                        frequency: config.frequency,
-                    });
+                    await clearCache({ automatic: true });
                 }
                 return;
             }
 
-            if (config.nextRunAt > 0 && now >= config.nextRunAt) {
-                await clearCache({
-                    automatic: true,
-                    reschedule: true,
-                    frequency: config.frequency,
-                });
+            if (timeMap[config.frequency] > 1 && config.nextRunAt > 0 && Date.now() >= config.nextRunAt) {
+                const res = await clearCache({ automatic: true });
+                if (res.status === "failed") retryScheduledRun();
+                else if (res.status === "cleaned" || res.status === "unchanged") scheduleNextRun();
             }
+        } catch (e) {
+            console.error("[cache-cleaner] autoRunCheck failed", e);
         } finally {
             autoRunInProgress = false;
         }
     }
 
-    await autoRunCheck();
+    config = loadConfig();
+    applyLanguage();
+    new Spicetify.Menu.Item(t("cacheCleaner"), false, openConfig).register();
     setInterval(autoRunCheck, 60 * 1000);
+    await autoRunCheck();
 })();

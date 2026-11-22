@@ -6,8 +6,8 @@
 *Install it, configure it, and let it run in the background.*
 
 <p>
-  <img src="https://img.shields.io/badge/VERSION-1.0.0-magenta?style=for-the-badge&logo=spotify" alt="Version">
-  <img src="https://img.shields.io/badge/SPICETIFY-2.43.2-1DB954?style=for-the-badge&logo=spotify" alt="Spicetify">
+  <img src="https://img.shields.io/badge/VERSION-1.1.0-magenta?style=for-the-badge&logo=spotify" alt="Version">
+  <img src="https://img.shields.io/badge/SPICETIFY-2.46.7-1DB954?style=for-the-badge&logo=spotify" alt="Spicetify">
   <a href="http://www.wtfpl.net/">
     <img src="https://img.shields.io/badge/LICENSE-WTFPL-red?style=for-the-badge" alt="License">
   </a>
@@ -29,11 +29,11 @@ The extension provides a modal where you can enable automatic cache cleanup, cho
 
 * **Manual cleanup:** run cleanup with the `Clear now` button.
 * **Automatic cleanup:** choose `On launch`, `Daily`, `Weekly`, `Monthly`, or `Never`.
-* **Size threshold:** clean cache only when it exceeds the configured size in MB.
+* **Size threshold:** cleans cache when it grows past the configured size in MB, separately from the schedule.
 * **Notifications:** enable or disable toast notifications after automatic cleanup.
 * **API status:** shows whether the storage API was found in the current Spotify client.
 * **Total cleared:** tracks how much cache Cache Cleaner has actually removed.
-* **RU/EN localization:** the extension switches between Russian and English based on the Spotify UI language.
+* **English and Russian UI:** Auto follows the Spotify interface language and uses the system language if Spotify does not report one. It picks Russian only for Russian and English for everything else. The language can also be set manually in the modal.
 
 ---
 
@@ -68,12 +68,15 @@ After Spotify restarts, open the profile menu and select **Cache Cleaner**.
 | :--- | :--- |
 | `Enable auto clean` | Enables or disables automatic cleanup |
 | `Show notification` | Shows notifications after automatic cleanup |
+| `Language` | Interface language: `Auto` (follows Spotify), `English` or `Русский` |
 | `Cleanup frequency` | Selects the schedule: launch/daily/weekly/monthly/never |
 | `Size threshold` | Cleans cache when it exceeds the configured size in MB; `0` disables the threshold |
 | `Clear now` | Runs cleanup manually |
 | `Refresh stats` | Refreshes the displayed cache size |
-| `Reset config` | Resets settings to defaults |
+| `Reset config` | Resets settings to defaults. Total cleared is kept |
 | `Total cleared cache by Cache Cleaner` | Shows the total amount of cache actually removed by the extension |
+
+**Defaults:** auto clean on, weekly schedule, notifications on, size threshold 0 (off), language Auto.
 
 Configuration is stored in `Spicetify.LocalStorage` under this key:
 
@@ -85,9 +88,9 @@ mkultra69:cache-cleaner:config:v2
 
 ## 🛠️ How It Works
 
-The extension waits for the Spicetify API to load, adds **Cache Cleaner** to the Spotify profile menu, and checks automatic cleanup conditions once per minute.
+The extension waits for the Spicetify API to load, adds **Cache Cleaner** to the Spotify profile menu, and checks automatic cleanup conditions once per minute. Between cleanups, this check asks Spotify for the cache size only when a size threshold is set.
 
-If `Size threshold` is enabled, cleanup can run independently of the selected schedule. If the storage API does not remove anything, the next threshold-based attempt is delayed for about one hour to avoid repeatedly hitting Spotify internals.
+If `Size threshold` is enabled, cleanup can run independently of the selected schedule. When the cache is still above the threshold after cleanup (for example, when downloads take most of it) or nothing was removed, the next threshold attempt waits about one hour. A scheduled cleanup that fails is retried in about one hour. Size checks time out after 15 seconds and the delete call after 2 minutes.
 
 ---
 
